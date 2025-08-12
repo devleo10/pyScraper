@@ -164,6 +164,10 @@ class MFAPIReplicator:
                 scheme_code = scheme.get('schemeCode')
                 scheme_name = scheme.get('schemeName')
 
+                # Open a fresh DB connection for each scheme
+                conn = self.get_conn()
+                cursor = conn.cursor()
+
                 # Store basic info from /mf endpoint
                 cursor.execute("""
                     INSERT INTO mf_schemes 
@@ -174,6 +178,8 @@ class MFAPIReplicator:
                         updated_at = NOW()
                 """, (scheme_code, scheme_name))
                 stored_count += 1
+                conn.commit()
+                conn.close()
 
                 # Immediately fetch and store fund details for this scheme
                 logger.debug(f"Fetching details for scheme {scheme_code}")
@@ -186,16 +192,11 @@ class MFAPIReplicator:
                 if (i + 1) % 10 == 0:
                     logger.info(f"Processed {i + 1}/{len(schemes)} schemes, {details_fetched} with details")
 
-                # Commit every 10 schemes to avoid long transactions
-                if (i + 1) % 10 == 0:
-                    conn.commit()
-
                 # Be polite to the API and avoid rate limits
                 time.sleep(0.2)
 
             except Exception as e:
                 logger.error(f"Error processing scheme {scheme.get('schemeCode')}: {e}")
-                conn.rollback()
                 continue
             
         # Final commit
