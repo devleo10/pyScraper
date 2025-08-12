@@ -158,11 +158,12 @@ class MFAPIReplicator:
         stored_count = 0
         details_fetched = 0
         
+        import time
         for i, scheme in enumerate(schemes):
             try:
                 scheme_code = scheme.get('schemeCode')
                 scheme_name = scheme.get('schemeName')
-                
+
                 # Store basic info from /mf endpoint
                 cursor.execute("""
                     INSERT INTO mf_schemes 
@@ -173,25 +174,27 @@ class MFAPIReplicator:
                         updated_at = NOW()
                 """, (scheme_code, scheme_name))
                 stored_count += 1
-                
+
                 # Immediately fetch and store fund details for this scheme
                 logger.debug(f"Fetching details for scheme {scheme_code}")
                 details = self.fetch_scheme_details(str(scheme_code))
                 if details:
                     self.store_scheme_details(str(scheme_code), details)
                     details_fetched += 1
-                
-                # Progress logging every 100 schemes
-                if (i + 1) % 100 == 0:
+
+                # Progress logging every 10 schemes
+                if (i + 1) % 10 == 0:
                     logger.info(f"Processed {i + 1}/{len(schemes)} schemes, {details_fetched} with details")
-                
-                # Commit every 50 schemes to avoid long transactions
-                if (i + 1) % 50 == 0:
+
+                # Commit every 10 schemes to avoid long transactions
+                if (i + 1) % 10 == 0:
                     conn.commit()
-                    
+
+                # Be polite to the API and avoid rate limits
+                time.sleep(0.2)
+
             except Exception as e:
-                # Skip duplicates and other errors
-                logger.debug(f"Skipping scheme {scheme.get('schemeCode')}: {e}")
+                logger.error(f"Error processing scheme {scheme.get('schemeCode')}: {e}")
                 conn.rollback()
                 continue
             
