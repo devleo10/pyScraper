@@ -146,8 +146,8 @@ class MFAPIReplicator:
         return schemes
     
     def store_schemes(self, schemes: List[Dict]):
-        """Store schemes in database with basic info only"""
-        logger.info(f"Starting to store {len(schemes)} schemes...")
+        """Store schemes in database and immediately fetch fund details"""
+        logger.info(f"Starting to store {len(schemes)} schemes and fetching fund details...")
         conn = self.get_conn()
         cursor = conn.cursor()
         
@@ -155,42 +155,50 @@ class MFAPIReplicator:
         if schemes:
             logger.info(f"Sample scheme data: {schemes[0]}")
         
-        batch_size = 1000
         stored_count = 0
+        details_fetched = 0
         
-        for i in range(0, len(schemes), batch_size):
-            batch = schemes[i:i + batch_size]
-            batch_num = i // batch_size + 1
-            total_batches = (len(schemes) + batch_size - 1) // batch_size
-            logger.info(f"Processing batch {batch_num}/{total_batches} ({len(batch)} schemes)")
+        for i, scheme in enumerate(schemes):
+            try:
+                scheme_code = scheme.get('schemeCode')
+                scheme_name = scheme.get('schemeName')
+                
+                # Store basic info from /mf endpoint
+                cursor.execute("""
+                    INSERT INTO mf_schemes 
+                    (scheme_code, scheme_name, created_at, updated_at)
+                    VALUES (%s, %s, NOW(), NOW())
+                    ON CONFLICT (scheme_code) DO UPDATE SET 
+                        scheme_name = EXCLUDED.scheme_name,
+                        updated_at = NOW()
+                """, (scheme_code, scheme_name))
+                stored_count += 1
+                
+                # Immediately fetch and store fund details for this scheme
+                logger.debug(f"Fetching details for scheme {scheme_code}")
+                details = self.fetch_scheme_details(str(scheme_code))
+                if details:
+                    self.store_scheme_details(str(scheme_code), details)
+                    details_fetched += 1
+                
+                # Progress logging every 100 schemes
+                if (i + 1) % 100 == 0:
+                    logger.info(f"Processed {i + 1}/{len(schemes)} schemes, {details_fetched} with details")
+                
+                # Commit every 50 schemes to avoid long transactions
+                if (i + 1) % 50 == 0:
+                    conn.commit()
+                    
+            except Exception as e:
+                # Skip duplicates and other errors
+                logger.debug(f"Skipping scheme {scheme.get('schemeCode')}: {e}")
+                conn.rollback()
+                continue
             
-            for scheme in batch:
-                try:
-                    # Only store basic info from /mf endpoint
-                    # Details will be fetched later from individual endpoints
-                    cursor.execute("""
-                        INSERT INTO mf_schemes 
-                        (scheme_code, scheme_name, created_at, updated_at)
-                        VALUES (%s, %s, NOW(), NOW())
-                        ON CONFLICT (scheme_code) DO UPDATE SET 
-                            scheme_name = EXCLUDED.scheme_name,
-                            updated_at = NOW()
-                    """, (
-                        scheme.get('schemeCode'),
-                        scheme.get('schemeName')
-                    ))
-                    stored_count += 1
-                except Exception as e:
-                    # Skip duplicates and other errors
-                    logger.debug(f"Skipping scheme {scheme.get('schemeCode')}: {e}")
-                    continue
-            
-            # Commit each batch
-            conn.commit()
-            logger.info(f"Committed batch {batch_num}, total stored: {stored_count}")
-        
+        # Final commit
+        conn.commit()
         conn.close()
-        logger.info(f"Successfully stored {stored_count} schemes in database")
+        logger.info(f"Successfully stored {stored_count} schemes and fetched {details_fetched} fund details")
     
     def fetch_scheme_details(self, scheme_code: str) -> Dict:
         """Fetch detailed information for a specific scheme"""
@@ -208,7 +216,7 @@ class MFAPIReplicator:
         cursor = conn.cursor()
         try:
             meta = details.get('meta', {})
-            
+
             # Update the mf_schemes table with detailed information
             cursor.execute("""
                 UPDATE mf_schemes SET 
@@ -223,7 +231,20 @@ class MFAPIReplicator:
                 meta.get('scheme_category', ''),
                 scheme_code
             ))
-            
+
+            # If the row does not exist (shouldn't happen), insert it
+            cursor.execute("""
+                INSERT INTO mf_schemes (scheme_code, scheme_name, fund_house, scheme_type, scheme_category, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (scheme_code) DO NOTHING
+            """, (
+                scheme_code,
+                meta.get('scheme_name', ''),
+                meta.get('fund_house', ''),
+                meta.get('scheme_type', ''),
+                meta.get('scheme_category', '')
+            ))
+
             # Also store in fund_details table
             cursor.execute("""
                 INSERT INTO fund_details 
@@ -245,7 +266,7 @@ class MFAPIReplicator:
                 meta.get('scheme_start_date', ''),
                 meta.get('scheme_name', '')
             ))
-            
+
             # Store NAV data
             nav_data = details.get('data', [])
             nav_stored = 0
@@ -264,7 +285,7 @@ class MFAPIReplicator:
                     nav_stored += 1
                 except (ValueError, TypeError) as e:
                     logger.warning(f"Invalid NAV data for scheme {scheme_code}: {e}")
-            
+
             conn.commit()
             logger.debug(f"Stored details for scheme {scheme_code} with {nav_stored} NAV records")
         except Exception as e:
@@ -375,49 +396,28 @@ class MFAPIReplicator:
         """Perform a complete sync of all data"""
         start_time = datetime.now()
         logger.info("Starting full sync...")
-        
+
         try:
-            # Step 1: Fetch and store all schemes (basic info only)
+            # Step 1: Fetch all schemes and immediately store fund details for each
             schemes = self.fetch_all_schemes()
-            self.store_schemes(schemes)
+            self.store_schemes(schemes)  # This now includes fund details fetching
             self.update_sync_metadata('mf_schemes', len(schemes))
-            
+            self.update_sync_metadata('fund_details', len(schemes))
+
             # Step 2: Store latest NAV
             self.store_latest_nav(schemes)
             self.update_sync_metadata('nav_data', len(schemes))
-            
-            # Step 3: Fetch detailed information for each scheme
-            if include_historical:
-                logger.info("Fetching detailed information for all schemes...")
-                scheme_codes = [str(scheme['schemeCode']) for scheme in schemes if scheme.get('schemeCode')]
-                
-                # Process in smaller batches to avoid overwhelming the API
-                batch_size = 100
-                total_batches = (len(scheme_codes) + batch_size - 1) // batch_size
-                
-                for i in range(0, len(scheme_codes), batch_size):
-                    batch = scheme_codes[i:i + batch_size]
-                    batch_num = i // batch_size + 1
-                    logger.info(f"Processing details batch {batch_num}/{total_batches} ({len(batch)} schemes)")
-                    
-                    self.sync_scheme_details_batch(batch, max_workers)
-                    
-                    # Progress update
-                    completed = min((i + batch_size), len(scheme_codes))
-                    logger.info(f"Completed {completed}/{len(scheme_codes)} scheme details")
-                
-                self.update_sync_metadata('fund_details', len(scheme_codes))
-            
+
             # Print statistics
             stats = self.get_database_stats()
             logger.info("Sync completed successfully!")
             logger.info("Database Statistics:")
             for table, count in stats.items():
                 logger.info(f"  {table}: {count:,} records")
-            
+
             duration = datetime.now() - start_time
             logger.info(f"Total sync time: {duration}")
-            
+
         except Exception as e:
             logger.error(f"Full sync failed: {e}")
             raise
