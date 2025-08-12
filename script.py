@@ -597,4 +597,24 @@ def main():
         raise
 
 if __name__ == "__main__":
-    main()
+    import os
+    import threading
+    try:
+        from flask import Flask
+        app = Flask(__name__)
+
+        def run_sync():
+            main()
+
+        # Start the sync in a background thread
+        threading.Thread(target=run_sync, daemon=True).start()
+
+        @app.route("/")
+        def status():
+            return "MFAPI sync is running!"
+
+        port = int(os.environ.get("PORT", 10000))
+        app.run(host="0.0.0.0", port=port)
+    except ImportError:
+        # Fallback: just run main if Flask is not available
+        main()
